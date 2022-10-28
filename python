@@ -1,0 +1,125 @@
+!apt-get install openjdk-11-jdk-headless -qq > /dev/null
+!wget -q https://archive.apache.org/dist/spark/spark-3.2.2/spark-3.2.2-bin-hadoop3.2.tgz
+!tar xf spark-3.2.2-bin-hadoop3.2.tgz
+!pip -q install findspark
+
+! java -version
+
+import os
+os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-11-openjdk-amd64"
+os.environ["SPARK_HOME"] = "/content/spark-3.2.2-bin-hadoop3.2"
+
+!pip -q install pyspark
+
+!pip -q install geopandas attrs shapely rtree apache-sedona[spark]
+
+#Descarga de Bases de Datos SCINCE 2020 y DENUE Mayo 2022
+
+!gdown 1ZhpcZ5woCJS8Q7sTqTtWBvIMqjlMb-FM
+
+!ls /content/*.zip
+
+!unzip /content/SCINCE_Parquets.zip -d /content/SCINCE_Parquets/ &> /dev/null
+
+import findspark
+findspark.init()
+import shapely
+import pandas as pd 
+import geopandas as gpd
+from pyspark.sql import SparkSession
+from pyspark import SparkContext
+from pyspark import SparkConf
+from sedona.register import SedonaRegistrator
+from sedona.utils import SedonaKryoRegistrator, KryoSerializer
+spark = SparkSession. \
+builder. \
+appName('GeoBigData'). \
+config("spark.serializer", KryoSerializer.getName). \
+config("spark.executor.memory", "5g"). \
+config("spark.driver.memory", "10g"). \
+config('spark.driver.maxResultSize', '5g'). \
+config("spark.kryo.registrator", SedonaKryoRegistrator.getName). \
+config('spark.jars.packages',
+           'org.apache.sedona:sedona-python-adapter-3.0_2.12:1.2.0-incubating,'
+           'org.datasyslab:geotools-wrapper:1.1.0-25.2'). \
+getOrCreate()
+SedonaRegistrator.registerAll(spark)
+
+BD_MANZANAS = spark.read.parquet(f"/content/SCINCE_Parquets/*.parquet")
+BD_MANZANAS_EEVVV = BD_MANZANAS.select('VIV17', 'VIV21', 'VIV23', 'geometry')
+BD_MANZANAS_EEVVV.cache()
+BD_MANZANAS_EEVVV.printSchema()
+BD_MANZANAS_EEVVV.show()
+
+BD_MANZANAS_EEVVV.createOrReplaceTempView("manzanas")
+
+BD_MZA_EEVVV_CORREGIDO = spark.sql("""select 
+                                  if( (isnull(VIV17) or VIV17 < 0 ), 0, VIV17) as VIV17, 
+                                  if( (isnull(VIV21) or VIV21 < 0 ), 0, VIV21) as VIV21,
+                                  if( (isnull(VIV23) or VIV23 < 0 ), 0, VIV23) as VIV23,                                  
+                                  geometry
+                             from manzanas """)
+
+BD_MZA_EEVVV_CORREGIDO.cache()
+BD_MZA_EEVVV_CORREGIDO.show()
+
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.clustering import KMeans
+
+vecAssembler = VectorAssembler(inputCols=["VIV17", "VIV21", "VIV23"], outputCol="features")
+BD_MZA_EEVVV_CORREGIDO_VEC = vecAssembler.transform(BD_MZA_EEVVV_CORREGIDO)
+BD_MZA_EEVVV_CORREGIDO_VEC.cache()
+BD_MZA_EEVVV_CORREGIDO_VEC.show()
+
+kmeans = KMeans(k=5, seed=1, maxIter=250) 
+model = kmeans.fit(BD_MZA_EEVVV_CORREGIDO_VEC.select('features'))
+transformed = model.transform(BD_MZA_EEVVV_CORREGIDO_VEC)
+transformed.show()
+
+transformed.createOrReplaceTempView("result_kmeans")
+clusters = spark.sql(""" select prediction, 
+    mean(VIV17) as mean_agua_vivienda, 
+    mean(VIV21) as mean_no_exc,
+    mean(VIV23) as mean_drenaje,
+    count(*) as conteo
+from result_kmeans group by prediction order by mean_agua_vivienda""")
+
+clusters.show()
+
+df_clusters = clusters.toPandas()
+
+df_clusters
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+categories = df_clusters.columns[1:-1].values
+cluster_0 = df_clusters.where(df_clusters.prediction==0).dropna().values[0][1:-1]
+cluster_1 = df_clusters.where(df_clusters.prediction==1).dropna().values[0][1:-1]
+cluster_2 = df_clusters.where(df_clusters.prediction==2).dropna().values[0][1:-1]
+cluster_3 = df_clusters.where(df_clusters.prediction==3).dropna().values[0][1:-1]
+cluster_4 = df_clusters.where(df_clusters.prediction==4).dropna().values[0][1:-1]
+
+cluster_0 = [*cluster_0,cluster_0[0]]
+cluster_1 = [*cluster_1,cluster_1[0]]
+cluster_2 = [*cluster_2,cluster_2[0]]
+cluster_3 = [*cluster_3,cluster_3[0]]
+cluster_4 = [*cluster_4,cluster_4[0]]
+
+label_loc = np.linspace(start=0, stop=2 * np.pi, num=len(cluster_0))
+
+plt.figure(figsize=(10, 10))
+plt.subplot(polar=True)
+plt.plot(label_loc, cluster_0, label='Cluster 0')
+plt.plot(label_loc, cluster_1, label='Cluster 1')
+plt.plot(label_loc, cluster_2, label='Cluster 2')
+plt.plot(label_loc, cluster_3, label='Cluster 3')
+plt.plot(label_loc, cluster_4, label='Cluster 4')
+plt.title('Comparacion de clusters', size=20)
+lines, labels = plt.thetagrids(np.degrees(label_loc), labels=categories)
+plt.legend()
+plt.show()
+
+#Verde = Cluster 4
+#Amarillo = Cluster 3 ; Cluster 0
+#Rojo = Cluster 1 ; Cluster 2
